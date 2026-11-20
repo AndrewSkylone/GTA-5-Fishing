@@ -54,6 +54,8 @@
     20% { opacity: 1; transform: translate(-50%, 0) scale(1.08); }
     100% { opacity: 0; transform: translate(-50%, -30px) scale(1); } }
 
+  .mute { position: fixed; right: 16px; bottom: 16px; width: 48px; height: 48px; border-radius: 12px;
+    border: 1px solid rgba(255,255,255,.2); background: var(--panel); color: var(--text); font-size: 22px; cursor: pointer; }
   .controls { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; }
   .controls button { width: 64px; height: 64px; border-radius: 14px; border: 1px solid rgba(255,255,255,.2);
     background: var(--panel); color: var(--text); font-size: 20px; font-weight: 700; cursor: pointer;
@@ -94,6 +96,7 @@
 </div>
 
 <div class="feedback" id="feedback"></div>
+<button class="mute" id="muteBtn" type="button">🔊</button>
 
 <div class="controls" id="controls">
   <button data-key="cast" class="wide" id="castBtn">Закинути<small>Пробіл</small></button>
@@ -125,6 +128,105 @@
       maxMisses: Math.round(lerp(5, 3, d)),   // к-сть можливих помилок
     };
   }
+
+  // ---------- Звуки (синтезуються через Web Audio, без файлів) ----------
+  const Sound = (() => {
+    let ac = null, master = null, noiseBuf = null;
+    let muted = false;
+    try { muted = localStorage.getItem('fishing-muted') === '1'; } catch (e) {}
+
+    function init() {
+      if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = muted ? 0 : 0.7;
+      master.connect(ac.destination);
+      noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+
+    // Шум через фільтр з обвідною гучності
+    function noise({ t = 0, dur, type = 'bandpass', f0, f1, q = 1, vol = 0.5, attack = 0.01 }) {
+      const start = ac.currentTime + t;
+      const src = ac.createBufferSource();
+      src.buffer = noiseBuf; src.loop = true;
+      const flt = ac.createBiquadFilter();
+      flt.type = type; flt.Q.value = q;
+      flt.frequency.setValueAtTime(f0, start);
+      flt.frequency.exponentialRampToValueAtTime(f1, start + dur);
+      const g = ac.createGain();
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(vol, start + attack);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      src.connect(flt).connect(g).connect(master);
+      src.start(start); src.stop(start + dur + 0.05);
+    }
+
+    // Тон з ковзанням частоти
+    function tone({ t = 0, dur, type = 'sine', f0, f1 = f0, vol = 0.3, attack = 0.01 }) {
+      const start = ac.currentTime + t;
+      const osc = ac.createOscillator();
+      osc.type = type;
+      osc.frequency.setValueAtTime(f0, start);
+      if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(f1, start + dur);
+      const g = ac.createGain();
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(vol, start + attack);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(g).connect(master);
+      osc.start(start); osc.stop(start + dur + 0.05);
+    }
+
+    const play = fn => () => { if (!ac || muted) return; fn(); };
+
+    return {
+      init,
+      get muted() { return muted; },
+      toggle() {
+        muted = !muted;
+        try { localStorage.setItem('fishing-muted', muted ? '1' : '0'); } catch (e) {}
+        if (master) master.gain.value = muted ? 0 : 0.7;
+        return muted;
+      },
+      // Свист вудки + тріск котушки
+      cast: play(() => {
+        noise({ dur: 0.35, f0: 300, f1: 2500, q: 2, vol: 0.5, attack: 0.15 });
+        for (let i = 0; i < 12; i++) {
+          noise({ t: 0.08 + i * 0.045, dur: 0.02, type: 'highpass', f0: 3000, f1: 3000, vol: 0.25 - i * 0.015, attack: 0.002 });
+        }
+      }),
+      // Плюх поплавка
+      splash: play(() => {
+        tone({ dur: 0.18, f0: 420, f1: 90, vol: 0.35 });
+        noise({ t: 0.02, dur: 0.4, type: 'lowpass', f0: 3000, f1: 300, vol: 0.35, attack: 0.005 });
+      }),
+      // Вдале натискання
+      hit: play(() => {
+        tone({ dur: 0.12, type: 'triangle', f0: 660, vol: 0.3 });
+        tone({ t: 0.08, dur: 0.18, type: 'triangle', f0: 990, vol: 0.3 });
+        noise({ dur: 0.12, f0: 1500, f1: 600, q: 3, vol: 0.15 }); // хлюп води
+      }),
+      // Промах
+      miss: play(() => {
+        tone({ dur: 0.32, type: 'sawtooth', f0: 200, f1: 80, vol: 0.18 });
+        tone({ dur: 0.32, type: 'square', f0: 140, f1: 60, vol: 0.08 });
+      }),
+      // Риба спіймана
+      win: play(() => {
+        noise({ dur: 0.6, type: 'lowpass', f0: 4000, f1: 400, vol: 0.35, attack: 0.005 });
+        [523, 659, 784, 1047].forEach((f, i) => tone({ t: 0.15 + i * 0.11, dur: 0.3, type: 'triangle', f0: f, vol: 0.25 }));
+        tone({ t: 0.6, dur: 0.6, type: 'triangle', f0: 1319, vol: 0.2 });
+      }),
+      // Риба зірвалась: тріск волосіні + низхідна мелодія
+      lose: play(() => {
+        noise({ dur: 0.08, type: 'highpass', f0: 2500, f1: 2500, vol: 0.45, attack: 0.002 });
+        [392, 349, 311, 262].forEach((f, i) => tone({ t: 0.2 + i * 0.18, dur: 0.3, type: 'triangle', f0: f, vol: 0.22 }));
+      }),
+    };
+  })();
 
   // ---------- DOM ----------
   const canvas = document.getElementById('c');
@@ -213,6 +315,7 @@
     S.jerk = null;
     S.fish = null;
     S.params = null;
+    Sound.cast();
     setMessage('', '');
     setControls('none');
     updateHud();
@@ -221,6 +324,7 @@
   function landed(now) {
     S.phase = 'waiting';
     S.biteAt = now + rand(...CFG.biteDelay);
+    Sound.splash();
     spawnSplash(floatBase().x, floatBase().y, 18);
     spawnRipple(floatBase().x, floatBase().y, 1.4);
     setMessage('', 'Чекаємо на кльов…');
@@ -251,6 +355,7 @@
     if (ok) {
       S.catchPct = Math.min(100, S.catchPct + S.params.points);
       showFeedback(`Влучно! +${S.params.points}%`, 'var(--good)');
+      if (S.catchPct <= CFG.winThreshold) Sound.hit();
       S.flash = { ok: true, start: now };
       setMessage('', '');
     } else {
@@ -265,6 +370,7 @@
     S.misses++;
     S.catchPct = Math.max(0, S.catchPct - CFG.missPenalty);
     showFeedback(label || `Не встиг! −${CFG.missPenalty}%`, 'var(--bad)');
+    if (S.misses < S.params.maxMisses) Sound.miss();
     S.flash = { ok: false, start: performance.now() };
     const left = S.params.maxMisses - S.misses;
     if (left > 0) setMessage('', `Залишилось спроб: <b>${left}</b>`);
@@ -275,12 +381,14 @@
       S.phase = 'result';
       S.jerk = null;
       spawnSplash(floatBase().x, floatBase().y, 40);
+      Sound.win();
       setMessage('Спіймано! 🎣', `Риба вагою <b>${S.fish.weight.toFixed(1)} кг</b> у садку.<br>Натисни <kbd>Пробіл</kbd>, щоб закинути знову`);
       setControls('cast');
       castBtn.firstChild.textContent = 'Ще раз';
     } else if (S.misses >= S.params.maxMisses) {
       S.phase = 'result';
       S.jerk = null;
+      Sound.lose();
       setMessage('Риба зірвалась', `Втекла риба на <b>${S.fish.weight.toFixed(1)} кг</b>.<br>Натисни <kbd>Пробіл</kbd>, щоб спробувати ще`);
       setControls('cast');
       castBtn.firstChild.textContent = 'Ще раз';
@@ -293,6 +401,8 @@
 
   function handleInput(action) {
     const now = performance.now();
+    Sound.init(); // аудіо дозволено лише після дії користувача
+    if (action === 'mute') { updateMuteBtn(Sound.toggle()); return; }
     if (action === 'cast') {
       if (S.phase === 'idle' || S.phase === 'result') cast();
       return;
@@ -322,9 +432,18 @@
   window.addEventListener('keydown', e => {
     if (e.repeat) return;
     if (e.code === 'Space') { e.preventDefault(); handleInput('cast'); return; }
+    if (e.code === 'KeyM') { handleInput('mute'); return; }
     const a = KEY_MAP[e.code];
     if (a) { e.preventDefault(); handleInput(a); }
   });
+  const muteBtn = $('muteBtn');
+  function updateMuteBtn(m) {
+    muteBtn.textContent = m ? '🔇' : '🔊';
+    muteBtn.title = (m ? 'Увімкнути' : 'Вимкнути') + ' звук (M)';
+  }
+  updateMuteBtn(Sound.muted);
+  muteBtn.addEventListener('click', () => { handleInput('mute'); muteBtn.blur(); });
+
   document.querySelectorAll('.controls button').forEach(b =>
     b.addEventListener('pointerdown', e => { e.preventDefault(); handleInput(b.dataset.key); }));
 
